@@ -59,19 +59,34 @@ static int sfdb_get_db_info(sfdb_t *db) {
     return 0;
 }
 
-void sfdb_close(sfdb_t *db) {
-    close(db->fd);
-    db->fd = -1;
+int sfdb_close(sfdb_t *db) {
+    if (close(db->fd) == 0) {
+        db->fd = -1;
+        return 0;
+    }
+    return -1;
 }
 
-int sfdb_open(const char *path, sfdb_t *db, uint32_t max_record_num, uint32_t record_len) {
-    rt_memset(db, 0, sizeof(sfdb_t));
-    db->fd = -1;
-
+/**
+ * @brief    创建一个SFDB
+ * @param    path:              数据库路径
+ * @param    db:                数据库结构体
+ * @param    max_record_num:    最大数据量
+ * @param    record_len:        单条数据长度
+ * @param    overwrite:         当 record_len 和 max_record_num 参数和数据库保存的参数不匹配时
+ *                              若该参数为1则进行覆盖
+ * @return   return
+ */
+int sfdb_open(const char *path, sfdb_t *db, uint32_t max_record_num, uint32_t record_len,
+              uint8_t overwrite) {
+    uint8_t retry_cnt = 0;
     if (record_len > MAX_RECORD_LEN) {
         LOG_E("record len:%d is larger than max record len:%d", record_len, MAX_RECORD_LEN);
         return -1;
     }
+retry:
+    rt_memset(db, 0, sizeof(sfdb_t));
+    db->fd = -1;
 
     db->fd = open(path, O_RDWR);
     if (db->fd < 0) {
@@ -88,26 +103,50 @@ int sfdb_open(const char *path, sfdb_t *db, uint32_t max_record_num, uint32_t re
         }
     } else {
         if (sfdb_get_db_info(db) < 0) {
-            LOG_E("get database information failed.");
-            goto err_close_db;
+            LOG_W("get database information failed.");
+            goto overwrite;
         }
 
         if (db->hdr.max_record_num != max_record_num) {
-            LOG_E("max record num not match.");
-            goto err_close_db;
+            LOG_W("max record num not match.");
+            goto try_overwrite;
         }
 
         if (db->hdr.record_len != record_len) {
-            LOG_E("record len not match");
-            goto err_close_db;
+            LOG_W("record len not match");
+            goto try_overwrite;
         }
     }
 
     return 0;
+try_overwrite:
+    if (overwrite == 0) {
+        goto err_close_db;
+    }
+overwrite:
+    if (db->fd > 0) {
+        close(db->fd);
+        db->fd = -1;
+    }
 
+    retry_cnt++;
+    if (retry_cnt > 3) {
+        goto err_close_db;
+    }
+
+    LOG_W("try to overwrite sfdb %s - %d", path, retry_cnt);
+    if (sfdb_delete(path) < 0) {
+        LOG_E("delete %s failed.", path);
+        goto err_close_db;
+    }
+    rt_thread_mdelay(10);
+    goto retry;
 err_close_db:
-    close(db->fd);
-    db->fd = -1;
+    LOG_E("open %s failed.");
+    if (db->fd > 0) {
+        close(db->fd);
+        db->fd = -1;
+    }
     return -1;
 }
 
@@ -156,8 +195,10 @@ int sfdb_append(sfdb_t *db, uint8_t *buf, uint16_t sz) {
 }
 
 /**
- * @brief    sfdb_read
+ * @brief    读数据库数据
  * @param offset: 读取的起始偏移地址（从0开始，且0表示最新一条数据）
+ * @note
+ * 通过该接口读取的数组第0个元素对应当前集合中最早存入的数据，数组下标最大的即为最近一次存入的数据
  * @return   return
  */
 int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32_t num) {
@@ -213,6 +254,50 @@ int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32
     }
     return read_total;
 }
+
+int sfdb_read_info(sfdb_t *db, sfdb_info_t *info) {
+    if (db->fd < 0) {
+        LOG_E("invalid fd");
+        return -1;
+    }
+
+    info->record_index = db->hdr.record_index;
+    info->record_count = db->hdr.record_count;
+    info->max_record_num = db->hdr.max_record_num;
+    info->record_len = db->hdr.record_len;
+
+    return 0;
+}
+
+/**
+ * @brief    重置数据库（清除数据库中的数据）
+ * @param    db: 数据库对象
+ * @return   成功：0 失败：-1
+ */
+int sfdb_reset(sfdb_t *db) {
+    if (db->fd < 0) {
+        LOG_E("invalid fd");
+        return -1;
+    }
+
+    db->hdr.record_index = 0;
+    db->hdr.record_count = 0;
+
+    /* 更新头 */
+    if (seek_and_write(db->fd, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
+        LOG_E("update hdr failed.");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief    删除数据库（后续需要修改为传入sfdb对象删除，对象中需要加入path）
+ * @param    param
+ * @return   return
+ */
+int sfdb_delete(const char *path) { return unlink(path); }
 /**************************************** TEST API ****************************************/
 // #define TEST_FILE_PATH "/sdcard/testFile.sdb"
 
@@ -256,7 +341,7 @@ void sdcard_test(void *param) {
     sfdb_t sfdb;
     uint8_t record[32] = {0};
     uint32_t tick_old, duration;
-    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN) < 0) {
+    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN, 0) < 0) {
         return;
     }
 
@@ -306,7 +391,7 @@ int sfdb_read_test(int argc, char *argv[]) {
     }
 
     tick_old = rt_tick_get();
-    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN) < 0) {
+    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN, 0) < 0) {
         LOG_E("open %s failed.", TEST_FILE_PATH);
         return -1;
     }

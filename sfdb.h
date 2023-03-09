@@ -32,4 +32,19 @@ typedef struct _sfdb {
     int fd;
 } sfdb_t;
 
+typedef struct _sfdb_info {
+    uint32_t record_index;
+    uint32_t record_count;
+    uint32_t max_record_num;
+    uint32_t record_len;
+} sfdb_info_t;
+
+int sfdb_open(const char *path, sfdb_t *db, uint32_t max_record_num, uint32_t record_len,
+              uint8_t overwrite);
+int sfdb_append(sfdb_t *db, uint8_t *buf, uint16_t sz);
+int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32_t num);
+int sfdb_read_info(sfdb_t *db, sfdb_info_t *info);
+int sfdb_close(sfdb_t *db);
+int sfdb_reset(sfdb_t *db);
+int sfdb_delete(const char *path);
 #endif /* __SFDB_H */
