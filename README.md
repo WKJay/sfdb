@@ -1,9 +1,6 @@
 # Simple File DatabBase - 简单文件数据库
 
-<center>
-<h2 style="color:#42b983">Simple and Fast ⚡</h2>
-<br/>
-</center>
+## Simple and Fast ⚡
 
 一个 **简单** 的文件型数据库，使用 **简单**，移植 **简单**，功能 **简单**，原理 **简单**，一切都很 **简单**，一切都很 **快**。
 
@@ -523,5 +520,7 @@ close_db:
 MSH_CMD_EXPORT_ALIAS(sfdb_read_test, sfdb_read, sfdb read data);
 ```
 # 支持
+
 ![支持](./docs/_assets/wechat_support.png)
+
 如果 SFDB 解决了你的问题，不妨扫描上面二维码请我喝杯咖啡吧 😄
