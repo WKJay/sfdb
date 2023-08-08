@@ -5,47 +5,41 @@
  * @Version
  * @Date           2023-02-13
  ***************************************************************/
-#include <rtthread.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/types.h>
-
 #include "sfdb.h"
 
-#define FILE_HEADER "SFDB001"  // Simple file database
+#define FILE_HEADER "SFDB002"  // Simple file database
 
 #define DB_HDR_OFFSET  0
 #define DB_DATA_OFFSET 512
 #define MAX_RECORD_LEN 512
 
-#define DBG_ENABLE
-#define DBG_SECTION_NAME "sfdb"
-#define DBG_LEVEL        DBG_INFO
-#define DBG_COLOR
-#include <rtdbg.h>
-
-static int seek_and_write(int fd, uint8_t *buf, uint32_t offset, uint32_t sz) {
+static int seek_and_write(sfdb_t *db, uint8_t *buf, uint32_t offset, uint32_t sz) {
     int ret = -1;
-    if (lseek(fd, offset, SEEK_SET) < 0) return -1;
-    ret = write(fd, buf, sz);
-    fsync(fd);
+    if (db->fs->sk(db->fd, offset) != offset) {
+        SF_LOG("seek failed");
+        return -1;
+    }
+    ret = db->fs->wr(db->fd, buf, sz);
+
+    if (db->flags & SFDB_SYNC) db->fs->sy(db->fd);
+
     return ret;
 }
 
-static int seek_and_read(int fd, uint8_t *buf, uint32_t offset, uint32_t sz) {
-    if (lseek(fd, offset, SEEK_SET) < 0) return -1;
-    return read(fd, buf, sz);
+static int seek_and_read(sfdb_t *db, uint8_t *buf, uint32_t offset, uint32_t sz) {
+    if (db->fs->sk(db->fd, offset) != offset) {
+        SF_LOG("seek failed");
+        return -1;
+    }
+    return db->fs->rd(db->fd, buf, sz);
 }
 
 static int sfdb_new_db(sfdb_t *db, uint32_t max_record_num, uint32_t record_len) {
-    rt_memcpy(db->hdr.magic, FILE_HEADER, sizeof(db->hdr.magic));
+    SF_MEMCPY(db->hdr.magic, FILE_HEADER, sizeof(db->hdr.magic));
     db->hdr.max_record_num = max_record_num;
     db->hdr.record_len = record_len;
-    rt_memset(db->page_data, 0xff, sizeof(db->page_data));
-    rt_memcpy(db->page_data, &db->hdr, sizeof(db->hdr));
 
-    if (seek_and_write(db->fd, db->page_data, 0, sizeof(db->page_data)) != sizeof(db->page_data)) {
+    if (seek_and_write(db, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
         return -1;
     }
 
@@ -53,18 +47,20 @@ static int sfdb_new_db(sfdb_t *db, uint32_t max_record_num, uint32_t record_len)
 }
 
 static int sfdb_get_db_info(sfdb_t *db) {
-    if (seek_and_read(db->fd, (void *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
+    if (seek_and_read(db, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
         return -1;
     }
     return 0;
 }
 
 int sfdb_close(sfdb_t *db) {
-    if (close(db->fd) == 0) {
-        db->fd = -1;
-        return 0;
+    if (db->state != SFDB_STATE_OPENED) {
+        SF_LOG("%s not opened", db->path);
+        return -1;
     }
-    return -1;
+    db->fs->cl(db->fd);
+    db->state = SFDB_STATE_CLOSED;
+    return 0;
 }
 
 /**
@@ -77,88 +73,88 @@ int sfdb_close(sfdb_t *db) {
  *                              若该参数为1则进行覆盖
  * @return   return
  */
-int sfdb_open(const char *path, sfdb_t *db, uint32_t max_record_num, uint32_t record_len,
-              uint8_t overwrite) {
+int sfdb_open(sfdb_t *db, sfdb_cfg_t *cfg) {
     uint8_t retry_cnt = 0;
-    if (record_len > MAX_RECORD_LEN) {
-        LOG_E("record len:%d is larger than max record len:%d", record_len, MAX_RECORD_LEN);
+    if (cfg->record_len > MAX_RECORD_LEN) {
+        SF_LOG("record len:%d is larger than max record len:%d", cfg->record_len, MAX_RECORD_LEN);
         return -1;
     }
 retry:
-    rt_memset(db, 0, sizeof(sfdb_t));
-    db->fd = -1;
+    SF_MEMSET(db, 0, sizeof(sfdb_t));
+    db->fs = &sfdb_fs;
+    db->path = cfg->path;
+    db->flags = cfg->flags;
 
-    db->fd = open(path, O_RDWR);
-    if (db->fd < 0) {
-        LOG_W("open file %s failed. try to create.", path);
-        db->fd = open(path, O_CREAT | O_RDWR);
-        if (db->fd < 0) {
-            LOG_E("create file %s failed.", path);
+    if (db->fs->op(db, db->path, SFDB_O_READ | SFDB_O_WRITE) < 0) {
+        SF_LOG("open file %s failed. try to create.", db->path);
+        if (db->fs->op(db, db->path, SFDB_O_CREATE | SFDB_O_READ | SFDB_O_WRITE) < 0) {
+            SF_LOG("create file %s failed.", db->path);
             return -1;
         }
+        db->state = SFDB_STATE_OPENED;
 
-        if (sfdb_new_db(db, max_record_num, record_len) < 0) {
-            LOG_E("create new database failed.");
+        if (sfdb_new_db(db, cfg->max_record_num, cfg->record_len) < 0) {
+            SF_LOG("create new database failed.");
             goto err_close_db;
         }
     } else {
+        db->state = SFDB_STATE_OPENED;
+
         if (sfdb_get_db_info(db) < 0) {
-            LOG_W("get database information failed.");
-            goto overwrite;
-        }
-
-        if (db->hdr.max_record_num != max_record_num) {
-            LOG_W("max record num not match.");
+            SF_LOG("get database information failed.");
             goto try_overwrite;
         }
 
-        if (db->hdr.record_len != record_len) {
-            LOG_W("record len not match");
+        if (db->hdr.max_record_num != cfg->max_record_num) {
+            SF_LOG("max record num not match.");
+            goto try_overwrite;
+        }
+
+        if (db->hdr.record_len != cfg->record_len) {
+            SF_LOG("record len not match");
             goto try_overwrite;
         }
     }
-
     return 0;
+
 try_overwrite:
-    if (overwrite == 0) {
-        goto err_close_db;
-    }
-overwrite:
-    if (db->fd > 0) {
-        close(db->fd);
-        db->fd = -1;
-    }
-
-    retry_cnt++;
-    if (retry_cnt > 3) {
+    if ((db->flags & SFDB_OVERWRITE) == 0) {
         goto err_close_db;
     }
 
-    LOG_W("try to overwrite sfdb %s - %d", path, retry_cnt);
-    if (sfdb_delete(path) < 0) {
-        LOG_E("delete %s failed.", path);
+    if (retry_cnt++ < 1) {
+        SF_LOG("try to overwrite sfdb %s.", db->path);
+    } else {
+        SF_LOG(" overwrite sfdb %s failed.", db->path);
         goto err_close_db;
     }
-    rt_thread_mdelay(10);
+
+    db->fs->cl(db->fd);
+    db->state = SFDB_STATE_CLOSED;
+
+    if (sfdb_delete(db) < 0) {
+        SF_LOG("delete %s failed.", db->path);
+        goto err_close_db;
+    }
+
     goto retry;
+
 err_close_db:
-    LOG_E("open %s failed.");
-    if (db->fd > 0) {
-        close(db->fd);
-        db->fd = -1;
-    }
+    SF_LOG("open %s failed.", db->path);
+    db->fs->cl(db->fd);
+    db->state = SFDB_STATE_CLOSED;
     return -1;
 }
 
 int sfdb_append(sfdb_t *db, uint8_t *buf, uint16_t sz) {
     uint32_t offset = 0;
     if (sz != db->hdr.record_len) {
-        LOG_E("data size %d is invalid(should be %d).", sz, db->hdr.record_len);
+        SF_LOG("data size %d is invalid(should be %d).", sz, db->hdr.record_len);
         return -1;
     }
 
     if (db->fd < 0) {
-        LOG_E("invalid fd");
+        SF_LOG("invalid fd");
         return -1;
     }
 
@@ -180,14 +176,14 @@ int sfdb_append(sfdb_t *db, uint8_t *buf, uint16_t sz) {
     offset = db->hdr.record_index * db->hdr.record_len + DB_DATA_OFFSET;
 
     /* 写入数据 */
-    if (seek_and_write(db->fd, buf, offset, sz) != sz) {
-        LOG_E("write data failed.");
+    if (seek_and_write(db, buf, offset, sz) != sz) {
+        SF_LOG("write data failed.");
         return -1;
     }
 
     /* 写入头 */
-    if (seek_and_write(db->fd, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
-        LOG_E("update hdr failed.");
+    if (seek_and_write(db, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
+        SF_LOG("update hdr failed.");
         return -1;
     }
 
@@ -196,19 +192,24 @@ int sfdb_append(sfdb_t *db, uint8_t *buf, uint16_t sz) {
 
 /**
  * @brief    读数据库数据
- * @param offset: 读取的起始偏移地址（从0开始，且0表示最新一条数据）
+ * @param    db     数据库对象
+ * @param    buf    读取数据的缓冲区
+ * @param    buf_sz 缓冲区大小
+ * @param    offset 读取的起始偏移地址（从0开始，且0表示最新一条数据）
+ * @param    num    读取的数据量
+ * @param    order  读取顺序 SFDB_READ_ASC：从旧到新 SFDB_READ_DESC：从新到旧
  * @note
  * 通过该接口读取的数组第0个元素对应当前集合中最早存入的数据，数组下标最大的即为最近一次存入的数据
- * @return   return
+ * @return   成功：返回读取的数据量 失败：-1
  */
-int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32_t num) {
+int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32_t num, uint8_t order) {
     uint32_t data_count = 0, read_num = 0, start_index = 0, read_total = 0;
     if (db->fd < 0) {
-        LOG_E("invalid fd");
+        SF_LOG("invalid fd");
         return -1;
     }
     if (buf_sz < num * db->hdr.record_len) {
-        LOG_E("provided buffer size %d < %d (required).", buf_sz, num * db->hdr.record_len);
+        SF_LOG("provided buffer size %d < %d (required).", buf_sz, num * db->hdr.record_len);
         return -1;
     }
 
@@ -218,32 +219,43 @@ int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32
 
     // 没有数据时直接返回
     if (data_count <= 0) return 0;
+    if (offset >= data_count) return 0;
     if (num == 0) return 0;
 
     /* 根据提供的起始偏移和读数数量来计算实际能够读取的数量 */
-    if (num > data_count) num = data_count;
     if ((offset + num) > data_count) num = data_count - offset;
     read_total = num;
 
     /* 计算起始读取索引 */
-    if (db->hdr.record_index < (offset + num - 1)) {  // 存在一部分数据在底部
-        start_index = db->hdr.max_record_num + db->hdr.record_index - (offset + num - 1);
-    } else {
-        start_index = db->hdr.record_index - (offset + num - 1);
+    if (order == SFDB_READ_ASC) {  // 从旧到新
+        if (db->hdr.record_index < (db->hdr.record_count - offset - 1)) {
+            start_index = db->hdr.record_index + offset + 1;
+        } else {
+            start_index = db->hdr.record_index + offset + 1 - db->hdr.record_count;
+        }
+    } else {                                              // 从新到旧
+        if (db->hdr.record_index < (offset + num - 1)) {  // 存在一部分数据在底部
+            start_index = db->hdr.record_count + db->hdr.record_index - (offset + num - 1);
+        } else {
+            start_index = db->hdr.record_index - (offset + num - 1);
+        }
     }
 
     while (num) {
         uint32_t read_offset = 0, read_len = 0;
         read_offset = DB_DATA_OFFSET + start_index * db->hdr.record_len;
-        if (start_index + num > db->hdr.max_record_num - 1) {  // 有一部分数据在头部，需要二次读取
+
+        if (start_index + num > db->hdr.max_record_num - 1) {
+            // 当前索引在数据底部，并且有一部分数据在头部，需要二次读取
             read_num = db->hdr.max_record_num - start_index;
         } else {
             read_num = num;
         }
+
         read_len = read_num * db->hdr.record_len;
 
-        if (seek_and_read(db->fd, buf, read_offset, read_len) != read_len) {
-            LOG_E("read data failed.");
+        if (seek_and_read(db, buf, read_offset, read_len) != read_len) {
+            SF_LOG("read data failed.");
             return -1;
         }
 
@@ -255,9 +267,15 @@ int sfdb_read(sfdb_t *db, uint8_t *buf, uint32_t buf_sz, uint32_t offset, uint32
     return read_total;
 }
 
+/**
+ * @brief    读数据库信息
+ * @param    db    数据库对象
+ * @param    info  数据库信息结构体
+ * @return   成功 0 失败 -1
+ */
 int sfdb_read_info(sfdb_t *db, sfdb_info_t *info) {
-    if (db->fd < 0) {
-        LOG_E("invalid fd");
+    if (db->state != SFDB_STATE_OPENED) {
+        SF_LOG("db %s not opened.", db->path);
         return -1;
     }
 
@@ -275,8 +293,8 @@ int sfdb_read_info(sfdb_t *db, sfdb_info_t *info) {
  * @return   成功：0 失败：-1
  */
 int sfdb_reset(sfdb_t *db) {
-    if (db->fd < 0) {
-        LOG_E("invalid fd");
+    if (db->state != SFDB_STATE_OPENED) {
+        SF_LOG("db %s not opened.", db->path);
         return -1;
     }
 
@@ -284,8 +302,8 @@ int sfdb_reset(sfdb_t *db) {
     db->hdr.record_count = 0;
 
     /* 更新头 */
-    if (seek_and_write(db->fd, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
-        LOG_E("update hdr failed.");
+    if (seek_and_write(db, (uint8_t *)&db->hdr, 0, sizeof(db->hdr)) != sizeof(db->hdr)) {
+        SF_LOG("update hdr failed.");
         return -1;
     }
 
@@ -293,141 +311,15 @@ int sfdb_reset(sfdb_t *db) {
 }
 
 /**
- * @brief    删除数据库（后续需要修改为传入sfdb对象删除，对象中需要加入path）
- * @param    param
- * @return   return
+ * @brief    删除数据库
+ * @param    db   数据库对象
+ * @return   成功：0 失败：-1
  */
-int sfdb_delete(const char *path) { return unlink(path); }
-/**************************************** TEST API ****************************************/
-// #define TEST_FILE_PATH "/sdcard/testFile.sdb"
+int sfdb_delete(sfdb_t *db) { return unlink(db->path); }
 
-// void sfdb_test(void) {
-//     int fd = -1;
-//     uint8_t buffer[64];
-//     uint32_t tick_old = 0, duration = 0;
-//     rt_kprintf("-----open file\r\n");
-//     fd = open(TEST_FILE_PATH, O_CREAT | O_RDWR);
-//     rt_kprintf("-----open file end\r\n");
-//     if (fd < 0) return;
-
-//     for (int i = 0; i < 10; i++) {
-//         for (int j = 0; j < sizeof(buffer); j++) {
-//             buffer[j] = i;
-//         }
-//         rt_kprintf("-----write  cnt %d\r\n", i);
-//         seek_and_write(fd, buffer, i * sizeof(buffer), sizeof(buffer));
-//         rt_kprintf("-----write cnt %d end\r\n", i);
-//     }
-
-//     for (int j = 0; j < sizeof(buffer); j++) {
-//         buffer[j] = 0x33;
-//     }
-//     rt_kprintf("-----modify file\r\n");
-//     seek_and_write(fd, buffer, 0, sizeof(buffer));
-//     rt_kprintf("-----modify file end\r\n");
-
-//     rt_kprintf("-----close file\r\n");
-//     close(fd);
-//     rt_kprintf("-----close file end\r\n");
-// }
-// MSH_CMD_EXPORT(sfdb_test, sfdb_test)
-
-#include <stdlib.h>
-#define TEST_FILE_PATH  "/sdcard/test.sdb"
-#define MAX_RECORD_NUM  10000
-#define RECORD_LEN      32
-#define TEST_APPEND_NUM 10100
-void sdcard_test(void *param) {
-    sfdb_t sfdb;
-    uint8_t record[32] = {0};
-    uint32_t tick_old, duration;
-    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN, 0) < 0) {
-        return;
-    }
-
-    for (int i = 0; i < TEST_APPEND_NUM; i++) {
-        snprintf((char *)record, sizeof(record), "sfdb test record %d", i + 1);
-        tick_old = rt_tick_get();
-        if (sfdb_append(&sfdb, record, sizeof(record)) < 0) {
-            LOG_E("append %d record failed.", i + 1);
-            sfdb_close(&sfdb);
-            return;
-        }
-        duration = rt_tick_get() - tick_old;
-        LOG_I("append %5d data cost %4d ms", i + 1, duration);
-    }
-
-    sfdb_close(&sfdb);
-    while (1) {
-        rt_thread_mdelay(10);
-    }
-}
-
-int sfdb_test_init(void) {
-    rt_thread_t tid = rt_thread_create("sd_test", sdcard_test, NULL, 4096, 12, 5);
-    if (tid) {
-        rt_thread_startup(tid);
-    }
-    return 0;
-}
-MSH_CMD_EXPORT(sfdb_test_init, sfdb_test_init);
-
-int sfdb_read_test(int argc, char *argv[]) {
-    int ret = -1;
-    uint32_t tick_old, duration, offset;
-    uint16_t number;
-    sfdb_t sfdb;
-
-    if (argc != 1 && argc != 3) {
-        printf("invalid arguments,please input:\r\n");
-        printf("1. sfdb_read\r\n");
-        printf("2. sfdb_read [offset] [number]\r\n");
-        return -1;
-    }
-
-    if (argc == 3) {
-        offset = atoi(argv[1]);
-        number = atoi(argv[2]);
-    }
-
-    tick_old = rt_tick_get();
-    if (sfdb_open(TEST_FILE_PATH, &sfdb, MAX_RECORD_NUM, RECORD_LEN, 0) < 0) {
-        LOG_E("open %s failed.", TEST_FILE_PATH);
-        return -1;
-    }
-    duration = rt_tick_get() - tick_old;
-    LOG_I("open database cost %4d ms", duration);
-
-    if (argc == 1) {
-        LOG_I("db index:%d", sfdb.hdr.record_index);
-        LOG_I("db count:%d", sfdb.hdr.record_count);
-        LOG_I("record len:%d", sfdb.hdr.record_len);
-    } else {
-        if (number > 100) number = 100;
-        uint32_t data_sz = number * sfdb.hdr.record_len;
-        uint8_t *data_buf = malloc(data_sz);
-        if (data_buf == NULL) {
-            LOG_E("allocate memory failed.");
-            goto close_db;
-        }
-        tick_old = rt_tick_get();
-        ret = sfdb_read(&sfdb, data_buf, data_sz, offset, number);
-        duration = rt_tick_get() - tick_old;
-        LOG_I("read %d data from %d cost %4d ms", ret, offset, duration);
-        LOG_I("------------DATA------------");
-        for (int i = 0; i < ret; i++) {
-            LOG_I("%-5d:%s", offset + i + 1,
-                  (char *)&data_buf[(ret - i - 1) * sfdb.hdr.record_len]);
-        }
-        LOG_I("----------DATA END----------");
-        free(data_buf);
-    }
-
-close_db:
-    tick_old = rt_tick_get();
-    sfdb_close(&sfdb);
-    duration = rt_tick_get() - tick_old;
-    LOG_I("close database cost %4d ms", duration);
-    return 0;
-}
-MSH_CMD_EXPORT_ALIAS(sfdb_read_test, sfdb_read, sfdb read data);
+/**
+ * @brief    同步数据库缓存到文件
+ * @param    db  数据库对象
+ * @return   成功：0 失败：-1
+ */
+int sfdb_sync(sfdb_t *db) { return db->fs->sy(db->fd); }

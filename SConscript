@@ -2,7 +2,10 @@ from building import *
 
 cwd     = GetCurrentDir()
 CPPPATH = [cwd]
-src     = ['sfdb.c']
+src     = Glob('*.c')
+
+if GetDepend('SFDB_USING_EXAMPLE'):
+    src = src + ['examples/rtthread/example.c']
 
 group = DefineGroup('sfdb', src, depend = [''], CPPPATH = CPPPATH)
 
