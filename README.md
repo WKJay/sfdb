@@ -1,4 +1,4 @@
-# Simple File DatabBase - 简单文件数据库
+# Simple File DataBase - 简单文件数据库
 
 ## Simple and Fast ⚡
 
